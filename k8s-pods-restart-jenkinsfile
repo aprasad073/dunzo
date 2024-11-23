@@ -1,0 +1,57 @@
+pipeline {
+    agent {
+        kubernetes {
+            yaml '''
+apiVersion: v1
+kind: Pod
+metadata:
+  name: jenkins-slave
+  namespace: prod-jenkins
+spec:
+  containers:
+  - name: shell
+    image: asia.gcr.io/common-infra-295209/custom-docker:v6
+    tty: true
+    volumeMounts:
+    - mountPath: /var/run/docker.sock
+      name: docker-sock  
+  volumes:
+  - name: docker-sock
+    hostPath:
+      path: /var/run/docker.sock
+'''
+        }
+    }
+  environment {
+    account = credentials("k8s-deployer-prod")
+  }
+  parameters {
+    choice(
+        choices: ['recommendation-ds-service', 'recommendation-service'],
+        name: 'NAMESPACE',
+        description: 'Select the Namespace of the deployment'
+)
+  }
+  stages {
+    stage('Rollout restart') {
+      steps {
+        script {
+            container('shell') {
+                sh 'cp $account ./account.json'
+                sh """
+                    SERVICE_ACCOUNT_EMAIL="k8s-deployer@prod-application.iam.gserviceaccount.com"
+                    GKE_CLUSTER_NAME="prod-gke"
+                    GKE_PROXY="10.14.16.5:8118"
+                    GOOGLE_PROJECT="prod-application"
+                    gcloud auth activate-service-account \$SERVICE_ACCOUNT_EMAIL --key-file=./account.json --project=\$GOOGLE_PROJECT
+                    gcloud container clusters get-credentials \$GKE_CLUSTER_NAME --region asia-south1 --project \$GOOGLE_PROJECT
+                    export https_proxy=\$GKE_PROXY
+                    kubectl rollout restart deploy -n $NAMESPACE
+                """
+            }
+        }
+      }
+    }
+  }
+}
+

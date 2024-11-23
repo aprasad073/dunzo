@@ -1,0 +1,152 @@
+pipeline {
+    agent {
+        kubernetes {
+            yaml '''
+apiVersion: v1
+kind: Pod
+metadata:
+  name: jenkins-slave
+  namespace: prod-jenkins
+spec:
+  containers:
+  - name: shell
+    image: asia.gcr.io/common-infra-295209/custom-docker:v1
+    tty: true
+    volumeMounts:
+    - mountPath: /var/run/docker.sock
+      name: docker-sock  
+    resources:
+      requests:
+        cpu: 2
+        ephemeral-storage: "1Gi"
+      limits:
+        ephemeral-storage: "2Gi"  
+  volumes:
+  - name: docker-sock
+    hostPath:
+      path: /var/run/docker.sock
+'''
+        }
+    }
+    environment {
+        account = credentials("${SERVICE_ACCOUNT_CREDS}")
+        REPO = "github.com/dunzoit/location-service.git"
+        ORGANISATION = "dunzo"
+        APP_NAME = "location-ds-service"
+        TAG = "$ORGANISATION/$APP_NAME"
+        GOOGLE_PROJECT = 'prod-application'
+        REGISTRY_URL = "asia.gcr.io/${GOOGLE_PROJECT}"
+        NAMESPACE = "$APP_NAME"
+    }
+    parameters {
+        string(
+                name: 'BRANCH',
+                defaultValue: '',
+                description: 'git branch to be build'
+        )
+        string(name: 'PROJECT_ID',
+                defaultValue: 'prod-application',
+                description: 'Google project id to be used'
+        )
+        string(name: 'GKE_CLUSTER_NAME',
+                defaultValue: 'prod-gke',
+                description: 'GKE Cluster to be used'
+        )
+        string(name: 'GKE_PROXY',
+                defaultValue: '',
+                description: 'GKE proxy'
+        )
+    }
+    stages {
+        stage('Git Checkout') {
+            steps {
+                script {
+                    withCredentials([string(credentialsId: 'GITHUB_ACCESS_TOKEN', variable: 'GITHUB_TOKEN')]) {
+                        git branch: "$BRANCH", url: "https://$GITHUB_TOKEN:x-oauth-basic@$REPO"
+                        GIT_COMMIT_HASH = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+                    }
+                }
+            }
+        }
+
+        stage('Docker Build and Push') {
+            steps {
+                script {
+                    container('shell') {
+                        withCredentials([
+                                string(credentialsId: 'GITHUB_ACCESS_TOKEN', variable: 'GITHUB_TOKEN'),
+                        ]) {
+                            sh 'cp $account ./account.json'
+
+                            sh """
+
+                           GCR_EXISTING_TAGS=\$(gcloud container images list-tags --filter="tags=$GIT_COMMIT_HASH" --format=json $REGISTRY_URL/$TAG)
+                            if [[ "\$GCR_EXISTING_TAGS" == "[]" ]]; then
+                              echo "GCR Tag does not exists"
+                            else
+                              echo "GCR Tag exists"
+                              echo "Exiting step."
+                              exit 0
+                            fi
+
+
+                            cp $account ./account.json
+                            gcloud auth activate-service-account $SERVICE_ACCOUNT_EMAIL --key-file=./account.json --project=$PROJECT_ID
+                            gcloud auth configure-docker
+
+                            echo "--> Pull service latest image if exists"    
+                            docker pull $REGISTRY_URL/$TAG:latest || true
+                            echo "--> Build service latest image using latest service and builder cache"   
+                            docker build \
+                                --network=host \
+                                --build-arg GITHUB_TOKEN=$GITHUB_TOKEN \
+                                -t $REGISTRY_URL/$TAG:$GIT_COMMIT_HASH \
+                                -t $REGISTRY_URL/$TAG:latest \
+                                -f ds/Dockerfile .
+    
+                            
+    
+                            echo "--> Push service latest & versioned image to registry" 
+                            docker push $REGISTRY_URL/$TAG:latest
+                            docker push $REGISTRY_URL/$TAG:$GIT_COMMIT_HASH
+                           
+                        """
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Produce Artifects for Spinnaker') {
+            steps {
+                script {
+                    container('shell') {
+                        sh 'cp $account ./account.json'
+                        sh """
+                           echo IMAGE=$REGISTRY_URL/$TAG:$GIT_COMMIT_HASH > spinnaker.properties
+                           echo COMMIT=$GIT_COMMIT_HASH >> spinnaker.properties
+
+                           # Connect to GKE cluster
+                           gcloud auth activate-service-account $SERVICE_ACCOUNT_EMAIL --key-file=./account.json --project=$PROJECT_ID
+                           gcloud container clusters get-credentials $GKE_CLUSTER_NAME --region asia-south1 --project $PROJECT_ID
+                           export https_proxy=$GKE_PROXY
+
+                           # Get current replicas
+                           REPLICAS=\$(kubectl get deploy -n $NAMESPACE --selector=app.kubernetes.io/instance=$APP_NAME -o json | jq '.items[-1].status.availableReplicas')
+                           if [ "\$REPLICAS" = "null" ]
+                           then
+                              REPLICAS=1
+                           fi
+                           
+                           echo REPLICAS=\$REPLICAS
+                           echo REPLICAS=\$REPLICAS >> spinnaker.properties
+                        """
+                        archiveArtifacts "spinnaker.properties"
+                    }
+                }
+            }
+        }
+    }
+}
+
+
