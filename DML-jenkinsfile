@@ -1,0 +1,95 @@
+pipeline {
+    agent {
+        kubernetes {
+            yaml '''
+                apiVersion: v1
+                kind: Pod
+                metadata:
+                  name: jenkins-slave
+                  namespace: prod-jenkins
+                spec:
+                  containers:
+                  - name: shell
+                    image: asia.gcr.io/common-infra-295209/custom-docker:py-psql-client
+                    tty: true
+                    command:
+                    - cat
+                    volumeMounts:
+                    - mountPath: /var/run/docker.sock
+                      name: docker-sock  
+                  volumes:
+                  - name: docker-sock
+                    hostPath:
+                      path: /var/run/docker.sock
+'''
+        }
+    }
+
+    parameters {
+        choice(
+            name: 'BRANCH',
+            choices: ['master', 'main'],
+            description: 'Select the branch to build'
+        )
+    }
+
+    environment {
+        REPO = "github.com/dunzoit/${REPO_NAME}.git"
+    }
+    stages {
+        stage ("Fetching DB User and PWD") {           
+            steps {
+                script {  
+                    container("shell") {
+                        withCredentials([file(credentialsId: 'jenkins_automation', variable: 'account_db_user_pwd')]) {
+                            sh "cp '$account_db_user_pwd' ./account_db_user_pwd.json"
+                        }
+                        withCredentials([string(credentialsId: 'PROD_VAULT_AUTH_TOKEN', variable: 'VAULT_AUTH_TOKEN')]) {
+                            sh '''
+                                gcloud auth activate-service-account --key-file=./account_db_user_pwd.json --project=${ENV}-application
+                                /usr/bin/python3 $(pwd)/jenkins/prod/prod-db-querry-automation/script.py ${DB_NAME} ${NAMESPACE} "$VAULT_AUTH_TOKEN"
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+        stage('Git Checkout & verifying if the filepath inputted exits or not') {
+            steps {
+                echo "Building ${params.BRANCH} branch"
+                script {
+                    withCredentials([string(credentialsId: 'GITHUB_ACCESS_TOKEN', variable: 'GITHUB_TOKEN')]) {
+                        git branch: "${params.BRANCH}", url: "https://$GITHUB_TOKEN:x-oauth-basic@${env.REPO}"
+                        def exists = fileExists "${env.WORKSPACE}/${FILE_PATH_IN_REPO_MASTER_BRANCH}"
+                        if (!exists) {
+                            currentBuild.result = 'ABORTED'
+                            error("Aborting the build as The specified path ${FILE_PATH_IN_REPO_MASTER_BRANCH} does not exits the the Repo")
+                        }
+                    }
+                }
+            }
+        }
+        stage('Running DML Commands/Queries') {
+            steps {
+                script {
+                    container("shell"){
+                        withCredentials([file(credentialsId: 'prod-db-rw-access-SA', variable: 'account_cloud_sql_rw')]) {
+                            sh "cp '$account_cloud_sql_rw' ./account_cloud_sql_rw.json"
+                        }
+                        sh '''
+                            set +x
+                            export DB_USER=$(grep -oE 'user: (.*)' creds.txt | cut -d' ' -f2)
+                            export DB_PASSWORD=$(grep -oE 'password: (.*)' creds.txt | cut -d' ' -f2)
+                            export DB_HOST=$(grep -oE 'endpoint: (.*)' creds.txt | cut -d' ' -f2)
+                            export DB_PORT=$(grep -oE 'port: (.*)' creds.txt | cut -d' ' -f2)
+                            # Authenticate with GCP and set the project
+                            gcloud auth activate-service-account --key-file=./account_cloud_sql_rw.json --project=${ENV}-application
+                            # Connect to the PostgreSQL database in GCP and run DDL commands/queries
+                            PGPASSWORD="${DB_PASSWORD}" psql -h "${DB_HOST}" -U "${DB_USER}" -p ${DB_PORT} -d "${DB_NAME}" < ./${FILE_PATH_IN_REPO_MASTER_BRANCH}
+                        '''
+                    }
+                }
+            }
+        }
+    }
+}

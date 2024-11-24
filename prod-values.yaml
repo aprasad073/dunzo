@@ -1,0 +1,390 @@
+USER-SUPPLIED VALUES:
+fluentd:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: node
+            operator: In
+            values:
+            - shared-app
+            - espresso
+  configMapConfigs:
+  - fluentd-prometheus-conf
+  env:
+  - name: FLUENT_ELASTICSEARCH_HOST
+    value: es-master.dunzo.in
+  - name: FLUENT_ELASTICSEARCH_PORT
+    value: "9200"
+  - name: FLUENT_ELASTICSEARCH_SCHEME
+    value: http
+  - name: FLUENT_UID
+    value: "0"
+  - name: APP_NAME
+    value: namespace_name
+  - name: SUB_SYSTEM
+    value: container_name
+  - name: APP_NAME_SYSTEMD
+    value: systemd
+  - name: SUB_SYSTEM_SYSTEMD
+    value: kubelet.service
+  - name: ENDPOINT
+    value: api.app.coralogix.in
+  - name: FLUENTD_CONF
+    value: ../../etc/fluent/fluent.conf
+  - name: LOG_LEVEL
+    value: debug
+  - name: K8S_NODE_NAME
+    valueFrom:
+      fieldRef:
+        fieldPath: spec.nodeName
+  fileConfigs:
+    01_sources.conf: ""
+    02_filters.conf: ""
+    03_dispatch.conf: ""
+    04_outputs.conf: ""
+    coralogix.conf: |-
+      <system>
+        log_level "#{ENV['LOG_LEVEL']}"
+        workers 2
+      </system>
+
+      <worker 0>
+      <source>
+        @type tail
+        @id in_tail_containers_logs1
+        path /var/log/containers/*.log
+        path_key filename
+        exclude_path /var/log/containers/offer-service*.log,/var/log/containers/preservice*.log,/var/log/containers/partner*.log,/var/log/containers/fulfillment-service*.log,/var/log/containers/payment-orchestrator-service*.log
+        pos_file /var/log/containers/crx1-container.log.pos
+        tag raw.containers.*
+        read_from_head false
+        refresh_interval 4s
+        rotate_wait 30s
+        # enable_stat_watcher false
+        <parse>
+        @type multi_format
+          <pattern>
+            format json
+            time_key time
+            time_format %Y-%m-%dT%H:%M:%S.%NZ
+            keep_time_key true
+          </pattern>
+          <pattern>
+            # format /^(?<time>.+) (?<stream>stdout|stderr) [^ ]* (?<log>.*)$/
+            format /^(?<log>.*)$/
+          </pattern>
+        </parse>
+      </source>
+
+      <filter **>
+        @type prometheus
+        <metric>
+          name fluentd_all_input_num_records_total1
+          type counter
+          desc The total number of incoming records
+          <labels>
+            tag ${tag}
+          </labels>
+        </metric>
+      </filter>
+
+      <match raw.containers.**>
+        @id raw.containers1
+        @type detect_exceptions
+        remove_tag_prefix raw
+        message log
+        stream stream
+        multiline_flush_interval 5
+        max_bytes 500000
+        max_lines 1000
+      </match>
+
+      <filter containers.**>
+        @type kubernetes_metadata
+        @id filter_kube_metadata1
+        skip_labels false
+        skip_container_metadata false
+        skip_namespace_metadata true
+        skip_master_url true
+      </filter>
+
+      <match containers.**>
+         @type rewrite_tag_filter
+         <rule>
+           key $.kubernetes.container_name
+           pattern ^(.+)$
+           tag $1.${tag}
+         </rule>
+      </match>
+
+      <filter {merchant-task-service}.containers.**>
+        @type concat
+        key log
+        separator "\n"
+        multiline_start_regexp /^{\"timestamp\"/
+        stream_identity_key filename
+        flush_interval 20
+        timeout_label @DISPATCH
+      </filter>
+
+      <filter {sake-catalog,sake-mss,sake-mpos}.containers.**>
+        @type concat
+        key log
+        separator "\n"
+        multiline_start_regexp /^{\"\d\/\d{2}\/\d{4}\s\d:\d{2}:\d{2}\s\w{2}\"/
+        stream_identity_key filename
+        flush_interval 20
+        timeout_label @DISPATCH
+      </filter>
+
+      <filter {dispatcher-retrier}.containers.**>
+        @type concat
+        key log
+        separator "\n"
+        multiline_end_regexp /^{\"\r\n\"/
+        stream_identity_key filename
+        flush_interval 20
+        timeout_label @DISPATCH
+      </filter>
+
+      <filter {sake-secondary,sake-pricing}.containers.**>
+        @type concat
+        key log
+        separator "\n"
+        multiline_start_regexp /^{\"\s*ReqID:\"/
+        stream_identity_key filename
+        flush_interval 20
+        timeout_label @DISPATCH
+      </filter>
+
+      <filter **>
+        @type record_transformer
+        <record>
+          env "prod"
+          component ${tag}
+        </record>
+      </filter>
+
+      <match **>
+        @type relabel
+        @label @DISPATCH1
+      </match>
+
+      <label @DISPATCH1>
+        <filter **>
+          @type record_transformer
+          enable_ruby true
+          auto_typecast true
+          renew_record true
+          <record>
+            privateKey "#{ENV['PRIVATE_KEY']}"
+            applicationName ${record.dig("kubernetes", "#{ENV['APP_NAME']}")}
+            subsystemName ${record.dig("kubernetes", "#{ENV['SUB_SYSTEM']}")}
+            computerName ${record.dig("kubernetes", "host")}
+            text ${record.to_json}
+          </record>
+        </filter>
+
+        <filter **>
+          @type prometheus
+          <metric>
+            name fluentd_output_num_records_to_coralogix1
+            type counter
+            desc The total number of records sent to Coralogix
+            <labels>
+              tag ${tag}
+            </labels>
+          </metric>
+        </filter>
+
+        <match **>
+          @type http
+          @id coralogix_http_output1
+          endpoint "https://#{ENV['ENDPOINT']}/logs/rest/singles"
+          headers_from_placeholders {"private_key":"${$.privateKey}"}
+          error_response_as_unrecoverable false
+          <buffer $.privateKey>
+            @type memory
+            flush_thread_count 4
+            chunk_limit_size 6MB
+            flush_interval 1s
+            overflow_action block
+            chunk_full_threshold 0.90
+            retry_max_times 10
+            retry_type periodic
+            retry_wait 8
+            compress gzip
+          </buffer>
+        </match>
+      </label>
+      </worker>
+      <worker 1>
+      <source>
+        @type tail
+        @id in_tail_high_volume_pods
+        path /var/log/containers/offer-service*.log,/var/log/containers/preservice*.log,/var/log/containers/partner*.log,/var/log/containers/fulfillment-service*.log,/var/log/containers/payment-orchestrator-service*.log
+        path_key filename
+        pos_file /var/log/containers/offer-containers.log.pos
+        tag raw.containers.*
+        read_from_head false
+        refresh_interval 4s
+        rotate_wait 30s
+        # enable_stat_watcher false
+        <parse>
+        @type multi_format
+          <pattern>
+            format json
+            time_key time
+            time_format %Y-%m-%dT%H:%M:%S.%NZ
+            keep_time_key true
+          </pattern>
+          <pattern>
+            # format /^(?<time>.+) (?<stream>stdout|stderr) [^ ]* (?<log>.*)$/
+            format /^(?<log>.*)$/
+          </pattern>
+        </parse>
+      </source>
+
+      <filter **>
+        @type prometheus
+        <metric>
+          name fluentd_all_input_num_records_total2
+          type counter
+          desc The total number of incoming records
+          <labels>
+            tag ${tag}
+          </labels>
+        </metric>
+      </filter>
+
+      <match raw.containers.**>
+        @id raw.containers2
+        @type detect_exceptions
+        remove_tag_prefix raw
+        message log
+        stream stream
+        multiline_flush_interval 5
+        max_bytes 500000
+        max_lines 1000
+      </match>
+
+      <filter containers.**>
+        @type kubernetes_metadata
+        @id filter_kube_metadata2
+        skip_labels false
+        skip_container_metadata false
+        skip_namespace_metadata true
+        skip_master_url true
+      </filter>
+
+      <match containers.**>
+         @type rewrite_tag_filter
+         <rule>
+           key $.kubernetes.container_name
+           pattern ^(.+)$
+           tag $1.${tag}
+         </rule>
+      </match>
+
+      <filter **>
+        @type record_transformer
+        <record>
+          env "prod"
+          component ${tag}
+        </record>
+      </filter>
+
+      <match **>
+        @type relabel
+        @label @DISPATCH2
+      </match>
+
+      <label @DISPATCH2>
+        <filter **>
+          @type record_transformer
+          enable_ruby true
+          auto_typecast true
+          renew_record true
+          <record>
+            privateKey "#{ENV['PRIVATE_KEY']}"
+            applicationName ${record.dig("kubernetes", "#{ENV['APP_NAME']}")}
+            subsystemName ${record.dig("kubernetes", "#{ENV['SUB_SYSTEM']}")}
+            computerName ${record.dig("kubernetes", "host")}
+            text ${record.to_json}
+          </record>
+        </filter>
+
+        <filter **>
+          @type prometheus
+          <metric>
+            name fluentd_output_num_records_to_coralogix2
+            type counter
+            desc The total number of records sent to Coralogix
+            <labels>
+              tag ${tag}
+            </labels>
+          </metric>
+        </filter>
+
+        <match **>
+          @type http
+          @id coralogix_http_output2
+          endpoint "https://#{ENV['ENDPOINT']}/logs/rest/singles"
+          headers_from_placeholders {"private_key":"${$.privateKey}"}
+          error_response_as_unrecoverable false
+          <buffer $.privateKey>
+            @type memory
+            flush_thread_count 4
+            chunk_limit_size 6MB
+            flush_interval 1s
+            overflow_action block
+            chunk_full_threshold 0.90
+            retry_max_times 10
+            retry_type periodic
+            retry_wait 8
+            compress gzip
+          </buffer>
+        </match>
+      </label>
+      </worker>
+  fullnameOverride: multi-core-fluentd
+  resources:
+    limits:
+      cpu: 2500m
+      memory: 1024Mi
+    requests:
+      cpu: 2500m
+      memory: 900Mi
+  volumeMounts:
+  - mountPath: /var/log
+    name: varlog
+  - mountPath: /var/log/stateful_containers
+    name: mntlogs
+    readOnly: true
+  - mountPath: /var/lib/docker/containers
+    name: varlibdockercontainers
+    readOnly: true
+  - mountPath: /etc/fluent
+    name: etcfluentd-main
+  - mountPath: /etc/fluent/config.d/
+    name: etcfluentd-config
+  volumes:
+  - hostPath:
+      path: /var/log
+    name: varlog
+  - hostPath:
+      path: /mnt/stateful_partition/var/lib/docker/containers
+    name: mntlogs
+  - hostPath:
+      path: /var/lib/docker/containers
+    name: varlibdockercontainers
+  - configMap:
+      defaultMode: 511
+      name: fluentd-main
+    name: etcfluentd-main
+  - configMap:
+      defaultMode: 511
+      name: fluentd-config
+    name: etcfluentd-config
